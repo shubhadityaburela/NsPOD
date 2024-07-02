@@ -13,13 +13,13 @@ from scipy.sparse import diags
 from scipy.linalg import cholesky
 
 import os
-inpath = "./data/wildlandfire/input/"
-impath = "./data/wildlandfire/seed=1/"
-immpath = "./plots/wildlandfire/seed=1/"
+inpath = "./data/Wildfire/input/"
+impath = "./data/Wildfire/mac/"
+immpath = "./plots/Wildfire/mac/"
 os.makedirs(impath, exist_ok=True)
 os.makedirs(immpath, exist_ok=True)
 
-
+seed = 10
 
 class NuclearNormAutograd(torch.autograd.Function):
     @staticmethod
@@ -132,7 +132,9 @@ t = np.load(inpath + 'Time.npy', allow_pickle=True)
 x_grid = np.load(inpath + '1D_Grid.npy', allow_pickle=True)
 x = x_grid[0]
 T = Q_wf[:len(x), :]
-seed = 10
+
+# Set the seed
+np.random.seed(seed)
 torch.manual_seed(seed)
 
 
@@ -152,19 +154,17 @@ inputs_tensor = torch.tensor(inputs, dtype=torch.float32)
 model = ShapeShiftNet()
 pretrained_load = True
 if pretrained_load:
-    state_dict_original = torch.load("./data/crossing_waves_sine_amplitude/seed=54/model_weights_crossing_sine_waves.pth")
-
+    state_dict_original = torch.load("./data/Crossing_waves/seed=54/Crossing_waves.pth")
     state_dict_new = model.state_dict()
-
     for name, param in state_dict_original.items():
         if name in state_dict_new:
             state_dict_new[name].copy_(param)
+    model.load_state_dict(state_dict_new, strict=False)
 
-model.load_state_dict(state_dict_new, strict=False)
 optimizer = optim.Adam(model.parameters(), lr=0.0001)
 
 # Training loop
-num_epochs = 1000
+num_epochs = 10
 lambda_k = 0.1
 for epoch in range(num_epochs + 1):
     x_NN, t_NN = inputs_tensor[:, 0:1], inputs_tensor[:, 1:2]
@@ -196,7 +196,10 @@ for epoch in range(num_epochs + 1):
 combined = f1_full + f2_full + f3_full
 Q_tilde = combined.view(Nx, Nt).detach().numpy()
 
+# Save the weights
+torch.save(model.state_dict(), impath + 'Wildfire.pth')
 
+# Plot the results
 fig, axs = plt.subplots(1, 8, figsize=(20, 4))
 vmin = np.min(Q)
 vmax = np.max(Q)
@@ -267,5 +270,4 @@ axs[7].set_xticks([])
 axs[7].set_yticks([])
 
 plt.colorbar(cax4, ax=axs.ravel().tolist(), orientation='vertical')
-fig.savefig(immpath + "NN-prediction", dpi=300, transparent=True)
-torch.save(model.state_dict(), impath + 'model_weights_wildfire_1d.pth')
+fig.savefig(immpath + "Wildfire_NN", dpi=300, transparent=True)

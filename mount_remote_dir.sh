@@ -4,7 +4,7 @@ USER_CLIENT="shubhadityaburela"
 NODE="node748.math.priv10.lan"
 
 USER_NODE="burela"
-PROJECT="low-rank-transport"
+PROJECT="NsPOD"
 
 
 LOCAL_PROJECT_PATH="/Users/${USER_CLIENT}/Python/${PROJECT}/"
