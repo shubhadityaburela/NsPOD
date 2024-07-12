@@ -13,13 +13,15 @@ from scipy.sparse import diags
 from scipy.linalg import cholesky
 
 import os
-inpath = "./data/Wildfire/input/"
-impath = "./data/Wildfire/mac/"
-immpath = "./plots/Wildfire/mac/"
+
+inpath = "./data/Wildfire/Poly/input/"
+impath = "./data/Wildfire/Poly/seed=10/"
+immpath = "./plots/Wildfire/Poly/seed=10/"
 os.makedirs(impath, exist_ok=True)
 os.makedirs(immpath, exist_ok=True)
 
 seed = 10
+
 
 class NuclearNormAutograd(torch.autograd.Function):
     @staticmethod
@@ -39,46 +41,42 @@ class NuclearNormAutograd(torch.autograd.Function):
 
 
 class ShapeShiftNet(nn.Module):
-    def __init__(self):
+    def __init__(self, p_init_coeffs1, p_init_coeffs2, p_init_coeffs3):
         super(ShapeShiftNet, self).__init__()
+
+        self.alphas1 = nn.ParameterList(
+            [nn.Parameter(torch.tensor([coeff], dtype=torch.float32), requires_grad=True) for coeff in p_init_coeffs1]
+        )
+        self.alphas2 = nn.ParameterList(
+            [nn.Parameter(torch.tensor([coeff], dtype=torch.float32), requires_grad=True) for coeff in p_init_coeffs2]
+        )
+        self.alphas3 = nn.ParameterList(
+            [nn.Parameter(torch.tensor([coeff], dtype=torch.float32), requires_grad=True) for coeff in p_init_coeffs3]
+        )
 
         self.elu = nn.ELU()
 
-        # Subnetwork for f^1 and shift^1
+        # Subnetwork for f^1
         self.f1_fc1 = nn.Linear(2, 5)
         self.f1_fc2 = nn.Linear(5, 10)
         self.f1_fc3 = nn.Linear(10, 5)
         self.f1_fc4 = nn.Linear(5, 1)
 
-        self.shift1_fc1 = nn.Linear(1, 5)
-        self.shift1_fc2 = nn.Linear(5, 5)
-        self.shift1_fc3 = nn.Linear(5, 1)
-
-        # Subnetwork for f^2 and shift^2
+        # Subnetwork for f^2
         self.f2_fc1 = nn.Linear(2, 5)
         self.f2_fc2 = nn.Linear(5, 10)
         self.f2_fc3 = nn.Linear(10, 5)
         self.f2_fc4 = nn.Linear(5, 1)
 
-        self.shift2_fc1 = nn.Linear(1, 5)
-        self.shift2_fc2 = nn.Linear(5, 5)
-        self.shift2_fc3 = nn.Linear(5, 1)
-
-        # Subnetwork for f^3 and shift^3
+        # Subnetwork for f^3
         self.f3_fc1 = nn.Linear(2, 5)
         self.f3_fc2 = nn.Linear(5, 10)
         self.f3_fc3 = nn.Linear(10, 5)
         self.f3_fc4 = nn.Linear(5, 1)
 
-        self.shift3_fc1 = nn.Linear(1, 5)
-        self.shift3_fc2 = nn.Linear(5, 5)
-        self.shift3_fc3 = nn.Linear(5, 1)
-
     def forward(self, x, t):
         # Pathway for f^1 and shift^1
-        shift1 = self.elu(self.shift1_fc1(t))
-        shift1 = self.elu(self.shift1_fc2(shift1))
-        shift1 = self.shift1_fc3(shift1)
+        shift1 = sum([coeff * t ** (1 - i) for i, coeff in enumerate(self.alphas1)])
 
         x_shifted1 = x + shift1
         f1 = self.elu(self.f1_fc1(torch.cat((x_shifted1, t), dim=1)))
@@ -92,9 +90,7 @@ class ShapeShiftNet(nn.Module):
         f1_without_shift = self.f1_fc4(f1_without_shift)
 
         # Pathway for f^2 and shift^2
-        shift2 = self.elu(self.shift2_fc1(t))
-        shift2 = self.elu(self.shift2_fc2(shift2))
-        shift2 = self.shift2_fc3(shift2)
+        shift2 = sum([coeff * t ** (1 - i) for i, coeff in enumerate(self.alphas2)])
 
         x_shifted2 = x + shift2
         f2 = self.elu(self.f2_fc1(torch.cat((x_shifted2, t), dim=1)))
@@ -108,9 +104,7 @@ class ShapeShiftNet(nn.Module):
         f2_without_shift = self.f2_fc4(f2_without_shift)
 
         # Pathway for f^3 and shift^3
-        shift3 = self.elu(self.shift3_fc1(t))
-        shift3 = self.elu(self.shift3_fc2(shift3))
-        shift3 = self.shift3_fc3(shift3)
+        shift3 = sum([coeff * t ** (i) for i, coeff in enumerate(self.alphas3)])
 
         x_shifted3 = x + shift3
         f3 = self.elu(self.f3_fc1(torch.cat((x_shifted3, t), dim=1)))
@@ -123,7 +117,7 @@ class ShapeShiftNet(nn.Module):
         f3_without_shift = self.elu(self.f3_fc3(f3_without_shift))
         f3_without_shift = self.f3_fc4(f3_without_shift)
 
-        return f1, f2, f3, f1_without_shift, f2_without_shift, f3_without_shift, shift1, shift2, shift3
+        return f1, f2, f3, f1_without_shift, f2_without_shift, f3_without_shift
 
 
 # Load the data
@@ -137,28 +131,33 @@ T = Q_wf[:len(x), :]
 np.random.seed(seed)
 torch.manual_seed(seed)
 
-
-Q = T/T.max()
-Q_tensor = torch.tensor(Q)
+Q = torch.tensor(T/T.max())
 Nx = len(x)
 Nt = len(t)
 xx, tt = np.meshgrid(x, t)
 
-
 # Inputs to the network
 inputs = np.stack([x.repeat(Nt), np.tile(t, Nx)], axis=1)
 inputs_tensor = torch.tensor(inputs, dtype=torch.float32)
-
+init_coefficients1 = [1, -1]
+init_coefficients2 = [-1, 1]
+init_coefficients3 = [0]
 
 # Define the model
-model = ShapeShiftNet()
+model = ShapeShiftNet(init_coefficients1, init_coefficients2, init_coefficients3)
 pretrained_load = True
 if pretrained_load:
-    state_dict_original = torch.load("./data/Crossing_waves/seed=54/Crossing_waves.pth")
+    state_dict_original = torch.load("./data/Crossing_waves/Poly/seed=54/Crossing_waves.pth")
     state_dict_new = model.state_dict()
     for name, param in state_dict_original.items():
         if name in state_dict_new:
             state_dict_new[name].copy_(param)
+
+    state_dict_new['alphas1.0'] = torch.tensor([1.00], dtype=torch.float32)  # state_dict_original['alphas2.0']
+    state_dict_new['alphas1.1'] = torch.tensor([-1.00], dtype=torch.float32)  # state_dict_original['alphas2.1']
+    state_dict_new['alphas2.0'] = torch.tensor([-1.00], dtype=torch.float32)  # -state_dict_original['alphas2.0']
+    state_dict_new['alphas2.1'] = torch.tensor([1.00], dtype=torch.float32)  # -state_dict_original['alphas2.1']
+
     model.load_state_dict(state_dict_new, strict=False)
 
 optimizer = optim.Adam(model.parameters(), lr=0.0001)
@@ -170,9 +169,9 @@ for epoch in range(num_epochs + 1):
     x_NN, t_NN = inputs_tensor[:, 0:1], inputs_tensor[:, 1:2]
 
     optimizer.zero_grad()
-    f1_full, f2_full, f3_full, f1_full_nos, f2_full_nos, f3_full_nos, s1, s2, s3 = model(x_NN, t_NN)
+    f1_full, f2_full, f3_full, f1_full_nos, f2_full_nos, f3_full_nos = model(x_NN, t_NN)
 
-    frobenius_loss = torch.norm(Q_tensor - f1_full.view(Nx, Nt) - f2_full.view(Nx, Nt) - f3_full.view(Nx, Nt), 'fro') ** 2
+    frobenius_loss = torch.norm(Q - f1_full.view(Nx, Nt) - f2_full.view(Nx, Nt) - f3_full.view(Nx, Nt), 'fro') ** 2
 
     nuclear_loss_q1 = NuclearNormAutograd.apply(f1_full_nos.view(Nx, Nt))
     nuclear_loss_q2 = NuclearNormAutograd.apply(f2_full_nos.view(Nx, Nt))
@@ -184,13 +183,17 @@ for epoch in range(num_epochs + 1):
     total_loss.backward(retain_graph=True)
     optimizer.step()
 
+    shift_coeffs1 = torch.tensor([p.item() for p in model.alphas1])
+    shift_coeffs2 = torch.tensor([p.item() for p in model.alphas2])
+
     if frobenius_loss < 1.0:
         print("Early stopping is triggered")
         break
 
     if epoch % 100 == 0:
         print(
-            f'Epoch {epoch}/{num_epochs}, Frob Loss: {frobenius_loss.item()}, Nuclear Loss: {nuclear_loss.item()}, Total loss: {total_loss.item()},')
+            f'Epoch {epoch}/{num_epochs}, Frob Loss: {frobenius_loss.item()}, Nuclear Loss: {nuclear_loss.item()}, Total loss: {total_loss.item()},'
+            f'Coefficients_1:{shift_coeffs1}, Coefficients_2:{shift_coeffs2}')
 
 
 combined = f1_full + f2_full + f3_full
@@ -201,11 +204,11 @@ torch.save(model.state_dict(), impath + 'Wildfire.pth')
 
 # Plot the results
 fig, axs = plt.subplots(1, 8, figsize=(20, 4))
-vmin = np.min(Q)
-vmax = np.max(Q)
+vmin = np.min(Q.detach().numpy())
+vmax = np.max(Q.detach().numpy())
 
 # Q
-axs[0].pcolormesh(xx.T, tt.T, Q, vmin=vmin, vmax=vmax)
+axs[0].pcolormesh(xx.T, tt.T, Q.detach().numpy(), vmin=vmin, vmax=vmax)
 axs[0].set_title(r"$\mathbf{Q}$")
 axs[0].set_xlabel("t")
 axs[0].set_ylabel("x")
@@ -229,7 +232,7 @@ axs[2].set_xticks([])
 axs[2].set_yticks([])
 
 # f^3
-axs[3].pcolormesh(xx.T, tt.T, f3_full.view(Nx,Nt).detach().numpy(), vmin=vmin, vmax=vmax)
+axs[3].pcolormesh(xx.T, tt.T, f3_full.view(Nx, Nt).detach().numpy(), vmin=vmin, vmax=vmax)
 axs[3].set_title(r"$\mathcal{T}^2\mathbf{Q}^2$")
 axs[3].set_xlabel("t")
 axs[3].set_ylabel("x")
@@ -244,9 +247,8 @@ axs[4].set_ylabel("x")
 axs[4].set_xticks([])
 axs[4].set_yticks([])
 
-
 # f^1
-axs[5].pcolormesh(xx.T, tt.T, f1_full_nos.view(Nx,Nt).detach().numpy(), vmin=vmin, vmax=vmax)
+axs[5].pcolormesh(xx.T, tt.T, f1_full_nos.view(Nx, Nt).detach().numpy(), vmin=vmin, vmax=vmax)
 axs[5].set_title(r"$\mathbf{Q}^1$")
 axs[5].set_xlabel("t")
 axs[5].set_ylabel("x")
@@ -254,7 +256,7 @@ axs[5].set_xticks([])
 axs[5].set_yticks([])
 
 # f^3
-axs[6].pcolormesh(xx.T, tt.T, f3_full_nos.view(Nx,Nt).detach().numpy(), vmin=vmin, vmax=vmax)
+axs[6].pcolormesh(xx.T, tt.T, f3_full_nos.view(Nx, Nt).detach().numpy(), vmin=vmin, vmax=vmax)
 axs[6].set_title(r"$\mathbf{Q}^2$")
 axs[6].set_xlabel("t")
 axs[6].set_ylabel("x")
@@ -262,7 +264,7 @@ axs[6].set_xticks([])
 axs[6].set_yticks([])
 
 # f^2
-cax4 = axs[7].pcolormesh(xx.T, tt.T, f2_full_nos.view(Nx,Nt).detach().numpy(), vmin=vmin, vmax=vmax)
+cax4 = axs[7].pcolormesh(xx.T, tt.T, f2_full_nos.view(Nx, Nt).detach().numpy(), vmin=vmin, vmax=vmax)
 axs[7].set_title(r"$\mathbf{Q}^3$")
 axs[7].set_xlabel("t")
 axs[7].set_ylabel("x")

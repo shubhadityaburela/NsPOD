@@ -15,8 +15,8 @@ from scipy.linalg import cholesky
 
 import os
 
-impath = "./data/Crossing_waves/mac/"
-immpath = "./plots/Crossing_waves/mac/"
+impath = "./data/Crossing_waves/Poly/seed=54/"
+immpath = "./plots/Crossing_waves/Poly/seed=54/"
 os.makedirs(impath, exist_ok=True)
 os.makedirs(immpath, exist_ok=True)
 
@@ -78,35 +78,33 @@ class NuclearNormAutograd(torch.autograd.Function):
 
 
 class ShapeShiftNet(nn.Module):
-    def __init__(self):
+    def __init__(self, p_init_coeffs1, p_init_coeffs2):
         super(ShapeShiftNet, self).__init__()
+
+        self.alphas1 = nn.ParameterList(
+            [nn.Parameter(torch.tensor([coeff], dtype=torch.float32), requires_grad=True) for coeff in p_init_coeffs1]
+        )
+        self.alphas2 = nn.ParameterList(
+            [nn.Parameter(torch.tensor([coeff], dtype=torch.float32), requires_grad=True) for coeff in p_init_coeffs2]
+        )
+
         self.elu = nn.ELU()
 
-        # Subnetwork for f^1 and shift^1
+        # Subnetwork for f^1
         self.f1_fc1 = nn.Linear(2, 5)
         self.f1_fc2 = nn.Linear(5, 10)
         self.f1_fc3 = nn.Linear(10, 5)
         self.f1_fc4 = nn.Linear(5, 1)
 
-        self.shift1_fc1 = nn.Linear(1, 5)
-        self.shift1_fc2 = nn.Linear(5, 5)
-        self.shift1_fc3 = nn.Linear(5, 1)
-
-        # Subnetwork for f^2 and shift^2
+        # Subnetwork for f^2
         self.f2_fc1 = nn.Linear(2, 5)
         self.f2_fc2 = nn.Linear(5, 10)
         self.f2_fc3 = nn.Linear(10, 5)
         self.f2_fc4 = nn.Linear(5, 1)
 
-        self.shift2_fc1 = nn.Linear(1, 5)
-        self.shift2_fc2 = nn.Linear(5, 5)
-        self.shift2_fc3 = nn.Linear(5, 1)
-
     def forward(self, x, t):
         # Pathway for f^1 and shift^1
-        shift1 = self.elu(self.shift1_fc1(t))
-        shift1 = self.elu(self.shift1_fc2(shift1))
-        shift1 = self.shift1_fc3(shift1)
+        shift1 = sum([coeff * t ** (3 - i) for i, coeff in enumerate(self.alphas1)])
 
         x_shifted1 = x + shift1
         f1 = self.elu(self.f1_fc1(torch.cat((x_shifted1, t), dim=1)))
@@ -120,9 +118,7 @@ class ShapeShiftNet(nn.Module):
         f1_without_shift = self.f1_fc4(f1_without_shift)
 
         # Pathway for f^2 and shift^2
-        shift2 = self.elu(self.shift2_fc1(t))
-        shift2 = self.elu(self.shift2_fc2(shift2))
-        shift2 = self.shift2_fc3(shift2)
+        shift2 = sum([coeff * t ** (1 - i) for i, coeff in enumerate(self.alphas2)])
 
         x_shifted2 = x + shift2
         f2 = self.elu(self.f2_fc1(torch.cat((x_shifted2, t), dim=1)))
@@ -135,7 +131,7 @@ class ShapeShiftNet(nn.Module):
         f2_without_shift = self.elu(self.f2_fc3(f2_without_shift))
         f2_without_shift = self.f2_fc4(f2_without_shift)
 
-        return f1, f2, shift1, shift2, f1_without_shift, f2_without_shift, shift1, shift2
+        return f1, f2, shift1, shift2, f1_without_shift, f2_without_shift
 
 ############################## Crossing waves example ##################################
 
@@ -158,8 +154,11 @@ inputs = np.stack([x.repeat(Nt), np.tile(t, Nx)], axis=1)
 inputs_tensor = torch.tensor(inputs, dtype=torch.float32).to(DEVICE)
 Q_tensor = torch.tensor(Q).to(DEVICE)
 
+init_coefficients1 = [0.01, 0, 1, 1]
+init_coefficients2 = [-1, 1]
+
 # Instantiate the model
-model = ShapeShiftNet()
+model = ShapeShiftNet(init_coefficients1, init_coefficients2)
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
 # Move the model to GPU
@@ -172,7 +171,7 @@ lambda_k = 0.5
 for epoch in range(num_epochs + 1):
     x_flat, t_flat = inputs_tensor[:, 0:1], inputs_tensor[:, 1:2]
     optimizer.zero_grad()
-    f1_full, f2_full, shift1_pred, shift2_pred, f1_full_nos, f2_full_nos, s1, s2 = model(x_flat, t_flat)
+    f1_full, f2_full, shift1_pred, shift2_pred, f1_full_nos, f2_full_nos = model(x_flat, t_flat)
 
     frobenius_loss = torch.norm(Q_tensor - f1_full.view(Nx, Nt) - f2_full.view(Nx, Nt), 'fro') ** 2
 
@@ -185,13 +184,17 @@ for epoch in range(num_epochs + 1):
     total_loss.backward(retain_graph=True)
     optimizer.step()
 
+    shift_coeffs1 = torch.tensor([p.item() for p in model.alphas1])
+    shift_coeffs2 = torch.tensor([p.item() for p in model.alphas2])
+
     if frobenius_loss < 1:
         print("Early stopping is triggered")
         break
 
     if epoch % 100 == 0:
         print(
-            f'Epoch {epoch}/{num_epochs}, Frob Loss: {frobenius_loss.item()}, Nuclear Loss: {nuclear_loss.item()}, Total loss: {total_loss.item()},')
+            f'Epoch {epoch}/{num_epochs}, Frob Loss: {frobenius_loss.item()}, Nuclear Loss: {nuclear_loss.item()}, Total loss: {total_loss.item()},'
+            f'Coefficients_1:{[coefficients1[i] for i in range(len(coefficients1))]}{shift_coeffs1}, Coefficients_2:{[coefficients2[i] for i in range(len(coefficients2))]}{shift_coeffs2}')
 
 combined = f1_full + f2_full
 Q_tilde = combined.view(Nx, Nt).detach().numpy()
