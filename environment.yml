@@ -1,0 +1,13 @@
+name: nspod
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - matplotlib=3.11
+  - numpy=2.5
+  - scipy=1.18
+  - libblas=*=*openblas
+  - pip
+  - pip:
+      - torch>=2.12
+      - torchvision>=0.27

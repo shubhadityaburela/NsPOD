@@ -1,26 +1,28 @@
 # -*- coding: utf-8 -*-
 
-import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from numpy import meshgrid
-import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader, Dataset
-from torch.autograd import gradcheck
-from numpy import exp, mod, meshgrid, cos, sin, exp, pi
 import numpy as np
-import matplotlib.pyplot as plt
-from scipy.ndimage import shift
-from math import sqrt
-from scipy.sparse import diags
-from scipy.linalg import cholesky
 import torch
-import torch.nn.init as init
-from scipy import sparse
-
 import os
-impath = "./data/single_wave/"
-immpath = "./plots/single_wave/"
+
+# =============================================================================
+# Universal Device Router & Fail-Safe Hardware Setup
+# =============================================================================
+if torch.cuda.is_available():
+    device = torch.device('cuda')
+elif torch.backends.mps.is_available():
+    device = torch.device('mps')
+else:
+    device = torch.device('cpu')
+
+print(f"--> Dynamic hardware router initialized. Active device: {device.type.upper()}")
+
+dtype = torch.float32
+pretrained_load = True
+
+
+impath = "./data/Single_wave/"
+immpath = "./plots/Single_wave/"
 os.makedirs(impath, exist_ok=True)
 os.makedirs(immpath, exist_ok=True)
 
@@ -34,11 +36,6 @@ seed = 1
 np.random.seed(seed)
 torch.manual_seed(seed)
 
-dtype  = torch.float32
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-pretrained_load = False
-print(device)
-
 Nx, Nt = 300, 300
 t_start = -10.0
 t_end = 10.0
@@ -50,6 +47,7 @@ t_device = torch.tensor(t.copy(),  dtype=dtype, device=device)
 coefficients = torch.tensor([-10.0, 1.5], dtype=dtype, device=device)
 sigma = torch.tensor(4.0, dtype=dtype, device=device)
 center_matrix = torch.tensor(150.0, dtype=dtype, device=device)
+
 
 @torch.jit.script
 def torch_polyval(coeffs, t_array):
@@ -74,11 +72,11 @@ def generate_data_single_wave(coefficient, x, t, center_of_matrix, sigma):
     Q = torch_gaussian(X, MU, sigma)
     return Q, shift
 
+
 Q, shift = generate_data_single_wave(coefficients, x_device, t_device, center_matrix, sigma)
 
 
 """## Define a model"""
-
 @torch.jit.script
 def nuclear_norm(input_matrix: torch.Tensor) -> torch.Tensor:
     # Forward computation
@@ -172,7 +170,7 @@ lambda_star = 0.005
 model = ShapeShiftNet(2, 1, 1, 1, 32, 4, x_flat, t_flat, center_matrix)
 
 if pretrained_load:
-    state_dict_original = torch.load("./data/single_wave/single_wave.pth")
+    state_dict_original = torch.load("./trained_weights/Single_wave/Single_wave.pth", map_location=device)
     state_dict_new = model.state_dict()
 
     for name, param in state_dict_original.items():
@@ -181,39 +179,58 @@ if pretrained_load:
     model.load_state_dict(state_dict_new, strict=False)
     jit_model = torch.jit.script(model)
     jit_model.to(device)
-    delta = 1e-1
+
+    # --- EVALUATION ONLY MODE ---
+    print("--> Pretrained model loaded successfully. Evaluating weights safely...")
+    jit_model.eval()
+    with torch.no_grad():
+        f1_full, f1_full_nos, c_raw = jit_model()
+
+        # Adding .clone() breaks the dangerous TorchScript view dependencies instantly!
+        T1Q1 = f1_full.view(Nx, Nt).clone()
+        Q1 = f1_full_nos.view(Nx, Nt).clone()
+        c = c_raw.clone()
+
+        # Calculate evaluation loss for tracking
+        frobenius_loss = torch.linalg.norm(Q - T1Q1, 'fro') / torch.linalg.norm(Q, 'fro')
+        nuclear_loss = lambda_star * NuclearNormAutograd.apply(Q1)
+        total_loss = frobenius_loss + nuclear_loss
+
+        print(
+            f"Pretrained Model Evaluation -> F: {frobenius_loss.item():.4f}, N: {nuclear_loss.item():.4f}, T: {total_loss.item():.4f}")
 else:
+    # --- TRAINING MODE ---
     jit_model = torch.jit.script(model)
     jit_model.to(device)
     delta = 1e-5
 
-optimizer = torch.optim.Adam(jit_model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(jit_model.parameters(), lr=lr)
 
-for epoch in range(num_epochs + 1):
-    optimizer.zero_grad()
+    for epoch in range(num_epochs + 1):
+        optimizer.zero_grad()
 
-    # Function call for the model
-    f1_full, f1_full_nos, c = jit_model()
-    T1Q1 = f1_full.view(Nx, Nt)
-    Q1 = f1_full_nos.view(Nx, Nt)
+        # Function call for the model
+        f1_full, f1_full_nos, c = jit_model()
+        T1Q1 = f1_full.view(Nx, Nt)
+        Q1 = f1_full_nos.view(Nx, Nt)
 
-    frobenius_loss = torch.linalg.norm(Q - T1Q1, 'fro')/ torch.linalg.norm(Q, 'fro')
-    nuclear_loss = lambda_star * NuclearNormAutograd.apply(Q1)
-    total_loss = frobenius_loss + nuclear_loss
+        frobenius_loss = torch.linalg.norm(Q - T1Q1, 'fro') / torch.linalg.norm(Q, 'fro')
+        nuclear_loss = lambda_star * NuclearNormAutograd.apply(Q1)
+        total_loss = frobenius_loss + nuclear_loss
 
-    total_loss.backward()
+        total_loss.backward()
+        optimizer.step()
 
-    optimizer.step()
+        if frobenius_loss < delta:
+            print("Early stopping is triggered")
+            break
 
-    if frobenius_loss < delta:
-        print("Early stopping is triggered")
-        break
-    with torch.no_grad():
-        if epoch % 10 == 0:
-            print("\n**************************************************************")
-            print(f'Epoch {epoch}/{num_epochs}, F: {frobenius_loss.item():.4f}, '
-                  f'N: {nuclear_loss.item():.4f}, '
-                  f'T: {total_loss.item():.4f}')
+        with torch.no_grad():
+            if epoch % 10 == 0:
+                print("\n**************************************************************")
+                print(f'Epoch {epoch}/{num_epochs}, F: {frobenius_loss.item():.4f}, '
+                      f'N: {nuclear_loss.item():.4f}, '
+                      f'T: {total_loss.item():.4f}')
 
 # Bring everything back to CPU
 Q = Q.cpu().detach().numpy()
@@ -231,8 +248,9 @@ rec_err = np.linalg.norm(Q - T1Q1) / np.linalg.norm(Q)
 print(f"RecErr: {rec_err}")
 
 """## Saving the results"""
+if not pretrained_load:
+    torch.save(model.state_dict(), impath + 'Single_wave.pth')
 
-torch.save(model.state_dict(), impath + 'single_wave.pth')
 np.save(impath + 'Q.npy', Q)
 np.save(impath + 'Q_tilde.npy', Q_tilde)
 np.save(impath + 'T1Q1.npy', T1Q1)

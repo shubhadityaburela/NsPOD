@@ -2,22 +2,26 @@
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from numpy import meshgrid
-import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader, Dataset
-from torch.autograd import gradcheck
-from numpy import exp, mod, meshgrid, cos, sin, exp, pi
 import numpy as np
-import matplotlib.pyplot as plt
-from scipy.ndimage import shift
-from math import sqrt
-from scipy.sparse import diags
-from scipy.linalg import cholesky
-
 import os
-impath = "./data/StraightCubic_wave/"
-immpath = "./plots/StraightCubic_wave/"
+
+# =============================================================================
+# Universal Device Router & Fail-Safe Hardware Setup
+# =============================================================================
+if torch.cuda.is_available():
+    device = torch.device('cuda')
+elif torch.backends.mps.is_available():
+    device = torch.device('mps')
+else:
+    device = torch.device('cpu')
+
+print(f"--> Dynamic hardware router initialized. Active device: {device.type.upper()}")
+
+dtype = torch.float32
+pretrained_load = True
+
+impath = "./data/Crossing_sine_StraightCubic_waves/"
+immpath = "./plots/Crossing_sine_StraightCubic_waves/"
 os.makedirs(impath, exist_ok=True)
 os.makedirs(immpath, exist_ok=True)
 
@@ -26,14 +30,9 @@ os.makedirs(immpath, exist_ok=True)
 ## Create data for example model
 """
 
-seed = 10
+seed = 1
 np.random.seed(seed)
 torch.manual_seed(seed)
-
-dtype  = torch.float32
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-pretrained_load = False
-print(device)
 
 Nx, Nt = 400, 200
 t_start = -10.0
@@ -65,21 +64,23 @@ def torch_gaussian(x, mu, sigma):
     return torch.exp(-torch.pow(x - mu, 2.0) / (2 * torch.pow(sigma, 2.0)))
 
 
-def generate_data_crossing_wave(coefficients1, coefficients2, x, t, center_of_matrix, sigma):
-    shift1 = torch_polyval(coefficients1, t)
-    shift2 = torch_polyval(coefficients2, t)
+def generate_data_crossing_wave_sine(coefficients1, coefficients2, x, t, center_of_matrix, sigma):
+    t_max = t_device[-1]
+    shift1 = torch_polyval(coefficients1, t_device)
+    shift2 = torch_polyval(coefficients2, t_device)
+    phase1 = torch.sin(torch.pi * t_device / t_max)[None, :]
+    phase2 = torch.cos(torch.pi * t_device / t_max)[None, :]
     X1, MU1 = torch.meshgrid(x, center_of_matrix + shift1)
     X2, MU2 = torch.meshgrid(x, center_of_matrix + shift2)
 
-    Q1 = torch_gaussian(X1, MU1, sigma)
-    Q2 = torch_gaussian(X2, MU2, sigma)
+    Q1 = phase1 * torch_gaussian(X1, MU1, sigma)
+    Q2 = phase2 * torch_gaussian(X2, MU2, sigma)
 
     Q = Q1 + Q2
 
     return Q, Q1, Q2, shift1, shift2
 
-Q, Q1, Q2, shift1, shift2 = generate_data_crossing_wave(coefficients1, coefficients2, x_device, t_device, center_matrix, sigma)
-
+Q, Q1, Q2, shift1, shift2 = generate_data_crossing_wave_sine(coefficients1, coefficients2, x_device, t_device, center_matrix, sigma)
 
 """## Define a model"""
 
@@ -158,6 +159,7 @@ class ShapeShiftNet(nn.Module):
         self.shift_out2 = torch.nn.Linear(N_hidden, N_out_c)
 
 
+    @torch.jit.export
     def forward(self):
         ################################ Shifts ####################################
         c1 = self.shift_in1(self.t_flat)
@@ -203,8 +205,8 @@ x_flat = (x_device).repeat_interleave(Nt).to(device=device, dtype=dtype).view(-1
 t_flat = (t_device).repeat(Nx).to(device=device, dtype=dtype).view(-1, 1)
 Q = torch.tensor(Q, dtype=dtype, device=device)
 
-lr = 0.0005
-num_epochs = 75000
+lr = 0.00005
+num_epochs = 50000
 lambda_star = 0.005
 
 """## Call the model"""
@@ -212,7 +214,7 @@ lambda_star = 0.005
 model = ShapeShiftNet(2, 1, 1, 1, 32, 4, x_flat, t_flat, center_matrix)
 
 if pretrained_load:
-    state_dict_original = torch.load("./data/StraightCubic_wave/StraightCubic_wave.pth")
+    state_dict_original = torch.load("./trained_weights/Crossing_sine_StraightCubic_waves/Crossing_sine_StraightCubic_waves.pth", map_location=device)
     state_dict_new = model.state_dict()
 
     for name, param in state_dict_original.items():
@@ -221,41 +223,62 @@ if pretrained_load:
     model.load_state_dict(state_dict_new, strict=False)
     jit_model = torch.jit.script(model)
     jit_model.to(device)
-    delta = 1e-1
+
+    # --- EVALUATION ONLY MODE ---
+    print("--> Pretrained model loaded successfully. Evaluating weights safely...")
+    jit_model.eval()
+    with torch.no_grad():
+        f1_full, f2_full, shift1_pred_raw, shift2_pred_raw, f1_full_nos, f2_full_nos = jit_model()
+
+        # Isolating specific JIT views using .clone() to prevent memory exceptions on macOS/MPS
+        T1Q1 = f1_full.view(Nx, Nt).clone()
+        T2Q2 = f2_full.view(Nx, Nt).clone()
+        Q1 = f1_full_nos.view(Nx, Nt).clone()
+        Q2 = f2_full_nos.view(Nx, Nt).clone()
+        shift1_pred = shift1_pred_raw.clone()
+        shift2_pred = shift2_pred_raw.clone()
+
+        # Calculate evaluation loss for tracking
+        frobenius_loss = torch.linalg.norm(Q - T1Q1 - T2Q2, 'fro') / torch.linalg.norm(Q, 'fro')
+        nuclear_loss = lambda_star * (NuclearNormAutograd.apply(Q1) + NuclearNormAutograd.apply(Q2))
+        total_loss = frobenius_loss + nuclear_loss
+
+        print(f"Pretrained Model Evaluation -> F: {frobenius_loss.item():.4f}, N: {nuclear_loss.item():.4f}, T: {total_loss.item():.4f}")
 else:
+    # --- TRAINING MODE ---
     jit_model = torch.jit.script(model)
     jit_model.to(device)
     delta = 1e-5
 
-optimizer = torch.optim.Adam(jit_model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(jit_model.parameters(), lr=lr)
 
-for epoch in range(num_epochs + 1):
-    optimizer.zero_grad()
+    for epoch in range(num_epochs + 1):
+        optimizer.zero_grad()
 
-    # Function call for the model
-    f1_full, f2_full, shift1_pred, shift2_pred, f1_full_nos, f2_full_nos = jit_model()
-    T1Q1 = f1_full.view(Nx, Nt)
-    T2Q2 = f2_full.view(Nx, Nt)
-    Q1 = f1_full_nos.view(Nx, Nt)
-    Q2 = f2_full_nos.view(Nx, Nt)
+        # Function call for the model
+        f1_full, f2_full, shift1_pred, shift2_pred, f1_full_nos, f2_full_nos = jit_model()
+        T1Q1 = f1_full.view(Nx, Nt)
+        T2Q2 = f2_full.view(Nx, Nt)
+        Q1 = f1_full_nos.view(Nx, Nt)
+        Q2 = f2_full_nos.view(Nx, Nt)
 
-    frobenius_loss = torch.linalg.norm(Q - T1Q1 - T2Q2, 'fro')/ torch.linalg.norm(Q, 'fro')
-    nuclear_loss = lambda_star * (NuclearNormAutograd.apply(Q1) + NuclearNormAutograd.apply(Q2))
-    total_loss = frobenius_loss + nuclear_loss
+        frobenius_loss = torch.linalg.norm(Q - T1Q1 - T2Q2, 'fro')/ torch.linalg.norm(Q, 'fro')
+        nuclear_loss = lambda_star * (NuclearNormAutograd.apply(Q1) + NuclearNormAutograd.apply(Q2))
+        total_loss = frobenius_loss + nuclear_loss
 
-    total_loss.backward()
+        total_loss.backward()
 
-    optimizer.step()
+        optimizer.step()
 
-    if frobenius_loss < delta:
-        print("Early stopping is triggered")
-        break
-    with torch.no_grad():
-        if epoch % 10 == 0:
-            print("\n**************************************************************")
-            print(f'Epoch {epoch}/{num_epochs}, F: {frobenius_loss.item():.4f}, '
-                  f'N: {nuclear_loss.item():.4f}, '
-                  f'T: {total_loss.item():.4f}')
+        if frobenius_loss < delta:
+            print("Early stopping is triggered")
+            break
+        with torch.no_grad():
+            if epoch % 10 == 0:
+                print("\n**************************************************************")
+                print(f'Epoch {epoch}/{num_epochs}, F: {frobenius_loss.item():.4f}, '
+                      f'N: {nuclear_loss.item():.4f}, '
+                      f'T: {total_loss.item():.4f}')
 
 # Bring everything back to CPU
 Q = Q.cpu().detach().numpy()
@@ -264,8 +287,17 @@ T1Q1 = T1Q1.cpu().detach().numpy()
 T2Q2 = T2Q2.cpu().detach().numpy()
 Q1 = Q1.cpu().detach().numpy()
 Q2 = Q2.cpu().detach().numpy()
-shift1 = shift1.cpu().detach().numpy()
-shift2 = shift2.cpu().detach().numpy()
+
+if isinstance(shift1, torch.Tensor):
+    shift1 = shift1.cpu().detach().numpy()
+else:
+    shift1 = np.array(shift1)
+
+if isinstance(shift2, torch.Tensor):
+    shift2 = shift2.cpu().detach().numpy()
+else:
+    shift2 = np.array(shift2)
+
 shift1_numpy = shift1_pred.cpu().detach().numpy()
 shift2_numpy = shift2_pred.cpu().detach().numpy()
 shift1_numpy_mat = shift1_numpy.reshape(Nx, Nt)
@@ -281,8 +313,8 @@ rec_err = np.linalg.norm(Q - T1Q1 - T2Q2) / np.linalg.norm(Q)
 print(f"RecErr: {rec_err}")
 
 """## Saving the results"""
-
-torch.save(model.state_dict(), impath + 'StraightCubic_wave.pth')
+if not pretrained_load:
+    torch.save(model.state_dict(), impath + 'Crossing_sine_StraightCubic_waves.pth')
 np.save(impath + 'Q.npy', Q)
 np.save(impath + 'Q_tilde.npy', Q_tilde)
 np.save(impath + 'T1Q1.npy', T1Q1)

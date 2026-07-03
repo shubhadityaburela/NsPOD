@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from numpy import meshgrid
 import torch.optim as optim
+from scipy import sparse
 from torch.utils.data import TensorDataset, DataLoader, Dataset
 from torch.autograd import gradcheck
 from numpy import exp, mod, meshgrid, cos, sin, exp, pi
@@ -16,8 +17,26 @@ from scipy.sparse import diags
 from scipy.linalg import cholesky
 
 import os
-impath = "./data/Sine_StraightCubic_wave/"
-immpath = "./plots/Sine_StraightCubic_wave/"
+import argparse
+
+# -----------------------------------------------------------------------------
+# NEW: allow a list of lambda_TV values from the command line
+# Example:
+#   python3 Crossing_StraightCubic_waves_TV.py --lambda_TV 0.1 1.0 10.0
+# -----------------------------------------------------------------------------
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--lambda_TV",
+    type=float,
+    nargs="+",
+    default=[1.0],
+    help="List of lambda_TV values to sweep over"
+)
+args = parser.parse_args()
+lambda_TV_list = args.lambda_TV
+
+impath = "./data/StraightCubic_wave_TV/"
+immpath = "./plots/StraightCubic_wave_TV/"
 os.makedirs(impath, exist_ok=True)
 os.makedirs(immpath, exist_ok=True)
 
@@ -26,13 +45,13 @@ os.makedirs(immpath, exist_ok=True)
 ## Create data for example model
 """
 
-seed = 1
+seed = 51
 np.random.seed(seed)
 torch.manual_seed(seed)
 
 dtype  = torch.float32
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-pretrained_load = True
+pretrained_load = False
 print(device)
 
 Nx, Nt = 400, 200
@@ -47,6 +66,7 @@ coefficients1 = torch.tensor([0.15,0,0.8,1.5], dtype=dtype, device=device)
 coefficients2 = torch.tensor([-18,2], dtype=dtype, device=device)
 sigma = torch.tensor(4.0, dtype=dtype, device=device)
 center_matrix = torch.tensor(200.0, dtype=dtype, device=device)
+
 
 @torch.jit.script
 def torch_polyval(coeffs, t_array):
@@ -65,23 +85,47 @@ def torch_gaussian(x, mu, sigma):
     return torch.exp(-torch.pow(x - mu, 2.0) / (2 * torch.pow(sigma, 2.0)))
 
 
-def generate_data_crossing_wave_sine(coefficients1, coefficients2, x, t, center_of_matrix, sigma):
-    t_max = t[-1]
+def central_FD2Matrix(N, h=1.0):
+    D = sparse.lil_matrix((N, N), dtype=float)
+
+    # interior: central second-order
+    for i in range(1, N - 1):
+        D[i, i - 1] = 1.0 / h**2
+        D[i, i] = -2.0 / h**2
+        D[i, i + 1] = 1.0 / h**2
+
+    # first row: forward second-order derivative
+    D[0, 0] = 2.0 / h**2
+    D[0, 1] = -5.0 / h**2
+    D[0, 2] = 4.0 / h**2
+    D[0, 3] = -1.0 / h**2
+
+    # last row: backward second-order derivative
+    D[-1, -4] = -1.0 / h**2
+    D[-1, -3] = 4.0 / h**2
+    D[-1, -2] = -5.0 / h**2
+    D[-1, -1] = 2.0 / h**2
+
+    D_1 = (D.transpose()).tocsr()
+
+    return D_1
+
+
+def generate_data_crossing_wave(coefficients1, coefficients2, x, t, center_of_matrix, sigma):
     shift1 = torch_polyval(coefficients1, t)
     shift2 = torch_polyval(coefficients2, t)
-    phase1 = torch.sin(torch.pi * t / t_max)[None, :]
-    phase2 = torch.cos(torch.pi * t / t_max)[None, :]
     X1, MU1 = torch.meshgrid(x, center_of_matrix + shift1)
     X2, MU2 = torch.meshgrid(x, center_of_matrix + shift2)
 
-    Q1 = phase1 * torch_gaussian(X1, MU1, sigma)
-    Q2 = phase2 * torch_gaussian(X2, MU2, sigma)
+    Q1 = torch_gaussian(X1, MU1, sigma)
+    Q2 = torch_gaussian(X2, MU2, sigma)
 
     Q = Q1 + Q2
 
     return Q, Q1, Q2, shift1, shift2
 
-Q, Q1, Q2, shift1, shift2 = generate_data_crossing_wave_sine(coefficients1, coefficients2, x_device, t_device, center_matrix, sigma)
+Q, Q1, Q2, shift1, shift2 = generate_data_crossing_wave(coefficients1, coefficients2, x_device, t_device, center_matrix, sigma)
+
 
 """## Define a model"""
 
@@ -205,94 +249,117 @@ x_flat = (x_device).repeat_interleave(Nt).to(device=device, dtype=dtype).view(-1
 t_flat = (t_device).repeat(Nx).to(device=device, dtype=dtype).view(-1, 1)
 Q = torch.tensor(Q, dtype=dtype, device=device)
 
-lr = 0.00005
-num_epochs = 50000
+lr = 0.0005
+num_epochs = 25000
 lambda_star = 0.005
+
+
+"""## Create the TV matrix"""
+DCSR = central_FD2Matrix(N=Nt)
+coo = DCSR.tocoo()
+indices = np.vstack((coo.row, coo.col))
+i = torch.LongTensor(indices)  # indices need to be of type LongTensor
+v = torch.FloatTensor(coo.data)  # values as FloatTensor
+shape = coo.shape
+D = torch.sparse_coo_tensor(i, v, torch.Size(shape)).to(device)
+
 
 """## Call the model"""
 
-model = ShapeShiftNet(2, 1, 1, 1, 32, 4, x_flat, t_flat, center_matrix)
+for lambda_TV in lambda_TV_list:
+    print(f"\n============================================================")
+    print(f"Running lambda_TV = {lambda_TV}")
+    print(f"============================================================")
 
-if pretrained_load:
-    state_dict_original = torch.load("./data/StraightCubic_wave/StraightCubic_wave.pth")
-    state_dict_new = model.state_dict()
+    model = ShapeShiftNet(2, 1, 1, 1, 32, 4, x_flat, t_flat, center_matrix)
 
-    for name, param in state_dict_original.items():
-        if name in state_dict_new:
-            state_dict_new[name].copy_(param)
-    model.load_state_dict(state_dict_new, strict=False)
-    jit_model = torch.jit.script(model)
-    jit_model.to(device)
-    delta = 1e-5
-else:
-    jit_model = torch.jit.script(model)
-    jit_model.to(device)
-    delta = 1e-5
+    if pretrained_load:
+        state_dict_original = torch.load("./data/StraightCubic_wave_TV/StraightCubic_wave_TV.pth")
+        state_dict_new = model.state_dict()
 
-optimizer = torch.optim.Adam(jit_model.parameters(), lr=lr)
+        for name, param in state_dict_original.items():
+            if name in state_dict_new:
+                state_dict_new[name].copy_(param)
+        model.load_state_dict(state_dict_new, strict=False)
+        jit_model = torch.jit.script(model)
+        jit_model.to(device)
+        delta = 1e-1
+    else:
+        jit_model = torch.jit.script(model)
+        jit_model.to(device)
+        delta = 1e-5
 
-for epoch in range(num_epochs + 1):
-    optimizer.zero_grad()
+    optimizer = torch.optim.Adam(jit_model.parameters(), lr=lr)
 
-    # Function call for the model
-    f1_full, f2_full, shift1_pred, shift2_pred, f1_full_nos, f2_full_nos = jit_model()
-    T1Q1 = f1_full.view(Nx, Nt)
-    T2Q2 = f2_full.view(Nx, Nt)
-    Q1 = f1_full_nos.view(Nx, Nt)
-    Q2 = f2_full_nos.view(Nx, Nt)
+    for epoch in range(num_epochs + 1):
+        optimizer.zero_grad()
 
-    frobenius_loss = torch.linalg.norm(Q - T1Q1 - T2Q2, 'fro')/ torch.linalg.norm(Q, 'fro')
-    nuclear_loss = lambda_star * (NuclearNormAutograd.apply(Q1) + NuclearNormAutograd.apply(Q2))
-    total_loss = frobenius_loss + nuclear_loss
+        # Function call for the model
+        f1_full, f2_full, shift1_pred, shift2_pred, f1_full_nos, f2_full_nos = jit_model()
+        T1Q1 = f1_full.view(Nx, Nt)
+        T2Q2 = f2_full.view(Nx, Nt)
+        Q1 = f1_full_nos.view(Nx, Nt)
+        Q2 = f2_full_nos.view(Nx, Nt)
+        shift1_mat = shift1_pred.view(Nx, Nt)
+        shift2_mat = shift2_pred.view(Nx, Nt)
 
-    total_loss.backward()
+        frobenius_loss = torch.linalg.norm(Q - T1Q1 - T2Q2, 'fro')/ torch.linalg.norm(Q, 'fro')
+        nuclear_loss = lambda_star * (NuclearNormAutograd.apply(Q1) + NuclearNormAutograd.apply(Q2))
+        TV_loss = lambda_TV * (torch.linalg.norm(shift1_mat @ D, ord=1)
+                               + torch.linalg.norm(shift2_mat @ D, ord=1))
+        total_loss = frobenius_loss + nuclear_loss + TV_loss
 
-    optimizer.step()
+        total_loss.backward()
 
-    if frobenius_loss < delta:
-        print("Early stopping is triggered")
-        break
-    with torch.no_grad():
-        if epoch % 10 == 0:
-            print("\n**************************************************************")
-            print(f'Epoch {epoch}/{num_epochs}, F: {frobenius_loss.item():.4f}, '
-                  f'N: {nuclear_loss.item():.4f}, '
-                  f'T: {total_loss.item():.4f}')
+        optimizer.step()
 
-# Bring everything back to CPU
-Q = Q.cpu().detach().numpy()
-Q_tilde = (T1Q1 + T2Q2).cpu().detach().numpy()
-T1Q1 = T1Q1.cpu().detach().numpy()
-T2Q2 = T2Q2.cpu().detach().numpy()
-Q1 = Q1.cpu().detach().numpy()
-Q2 = Q2.cpu().detach().numpy()
-shift1 = shift1.cpu().detach().numpy()
-shift2 = shift2.cpu().detach().numpy()
-shift1_numpy = shift1_pred.cpu().detach().numpy()
-shift2_numpy = shift2_pred.cpu().detach().numpy()
-shift1_numpy_mat = shift1_numpy.reshape(Nx, Nt)
-shift2_numpy_mat = shift2_numpy.reshape(Nx, Nt)
-shift1_pred = shift1_numpy * t_flat.cpu().detach().numpy()
-shift2_pred = shift2_numpy * t_flat.cpu().detach().numpy()
-shift1_pred_mat = shift1_pred.reshape(Nx, Nt)
-shift2_pred_mat = shift2_pred.reshape(Nx, Nt)
-shift1_val = shift1_pred_mat.max(axis=0)
-shift2_val = shift2_pred_mat.max(axis=0)
+        if frobenius_loss < delta:
+            print("Early stopping is triggered")
+            break
+        with torch.no_grad():
+            if epoch % 10 == 0:
+                print("\n**************************************************************")
+                print(f'lambda_TV={lambda_TV} | Epoch {epoch}/{num_epochs}, F: {frobenius_loss.item():.4f}, '
+                      f'N: {nuclear_loss.item():.4f}, '
+                      f'TV: {TV_loss.item():.4f}, '
+                      f'T: {total_loss.item():.4f}')
 
-rec_err = np.linalg.norm(Q - T1Q1 - T2Q2) / np.linalg.norm(Q)
-print(f"RecErr: {rec_err}")
+    # Bring everything back to CPU
+    Q_np = Q.cpu().detach().numpy()
+    Q_tilde_np = (T1Q1 + T2Q2).cpu().detach().numpy()
+    T1Q1_np = T1Q1.cpu().detach().numpy()
+    T2Q2_np = T2Q2.cpu().detach().numpy()
+    Q1_np = Q1.cpu().detach().numpy()
+    Q2_np = Q2.cpu().detach().numpy()
+    shift1_np = shift1.cpu().detach().numpy()
+    shift2_np = shift2.cpu().detach().numpy()
+    shift1_numpy = shift1_pred.cpu().detach().numpy()
+    shift2_numpy = shift2_pred.cpu().detach().numpy()
+    shift1_numpy_mat = shift1_numpy.reshape(Nx, Nt)
+    shift2_numpy_mat = shift2_numpy.reshape(Nx, Nt)
+    shift1_pred_np = shift1_numpy * t_flat.cpu().detach().numpy()
+    shift2_pred_np = shift2_numpy * t_flat.cpu().detach().numpy()
+    shift1_pred_mat = shift1_pred_np.reshape(Nx, Nt)
+    shift2_pred_mat = shift2_pred_np.reshape(Nx, Nt)
+    shift1_val = shift1_pred_mat.max(axis=0)
+    shift2_val = shift2_pred_mat.max(axis=0)
 
-"""## Saving the results"""
+    rec_err = np.linalg.norm(Q_np - T1Q1_np - T2Q2_np) / np.linalg.norm(Q_np)
+    print(f"RecErr: {rec_err}")
 
-torch.save(model.state_dict(), impath + 'Sine_StraightCubic_wave.pth')
-np.save(impath + 'Q.npy', Q)
-np.save(impath + 'Q_tilde.npy', Q_tilde)
-np.save(impath + 'T1Q1.npy', T1Q1)
-np.save(impath + 'T2Q2.npy', T2Q2)
-np.save(impath + 'Q1.npy', Q1)
-np.save(impath + 'Q2.npy', Q2)
-np.save(impath + 'shifts1.npy', shift1_val)
-np.save(impath + 'shifts2.npy', shift2_val)
-np.save(impath + 'shifts1_true.npy', shift1)
-np.save(impath + 'shifts2_true.npy', shift2)
+    """## Saving the results"""
 
+    # NEW: unique suffix per lambda_TV so that all runs are preserved
+    lam_str = f"{lambda_TV:g}".replace('.', 'p')
+
+    torch.save(model.state_dict(), impath + f'StraightCubic_wave_TV_lambdaTV_{lam_str}.pth')
+    np.save(impath + f'Q_lambdaTV_{lam_str}.npy', Q_np)
+    np.save(impath + f'Q_tilde_lambdaTV_{lam_str}.npy', Q_tilde_np)
+    np.save(impath + f'T1Q1_lambdaTV_{lam_str}.npy', T1Q1_np)
+    np.save(impath + f'T2Q2_lambdaTV_{lam_str}.npy', T2Q2_np)
+    np.save(impath + f'Q1_lambdaTV_{lam_str}.npy', Q1_np)
+    np.save(impath + f'Q2_lambdaTV_{lam_str}.npy', Q2_np)
+    np.save(impath + f'shifts1_lambdaTV_{lam_str}.npy', shift1_val)
+    np.save(impath + f'shifts2_lambdaTV_{lam_str}.npy', shift2_val)
+    np.save(impath + f'shifts1_true_lambdaTV_{lam_str}.npy', shift1_np)
+    np.save(impath + f'shifts2_true_lambdaTV_{lam_str}.npy', shift2_np)
